@@ -5,18 +5,23 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 func init() {
 	// stdout is used for streaming, so use stderr for everything
-	log.SetOutput(os.Stderr)
+	log.Logger = log.Output(zerolog.ConsoleWriter{
+		Out:        os.Stderr,
+		TimeFormat: time.RFC3339,
+	}).With().Caller().Logger()
 }
 
 const connectionReadTimeout = time.Minute * 2
@@ -54,7 +59,10 @@ func (s *Server) addClient(conn net.Conn) {
 	s.clients[conn] = &client
 	s.mutex.Unlock()
 
-	log.Printf("Client connected: %s (total clients: %d)", conn.RemoteAddr(), numclients)
+	log.Info().
+		Str("addr", conn.RemoteAddr().String()).
+		Int("total_clients", numclients).
+		Msg("Client connected")
 
 	conn.SetWriteDeadline(time.Now().Add(connectionWriteTimeout))
 	defer conn.SetWriteDeadline(time.Time{})
@@ -111,7 +119,10 @@ func (s *Server) addClient(conn net.Conn) {
 		for data := range client.Frames {
 			_, err := conn.Write(data)
 			if err != nil {
-				log.Printf("Error broadcasting to %s: %v", conn.RemoteAddr(), err)
+				log.Error().
+					Err(err).
+					Str("addr", conn.RemoteAddr().String()).
+					Msg("Error broadcasting to client")
 				s.removeClient(conn, err.Error())
 				return
 			}
@@ -138,7 +149,10 @@ func (s *Server) removeClient(conn net.Conn, message string) {
 		"Goodbye!\r\n")
 
 	s.mutex.RLock()
-	log.Printf("Client disconnected: %s (total clients: %d)", conn.RemoteAddr(), len(s.clients))
+	log.Info().
+		Str("addr", conn.RemoteAddr().String()).
+		Int("total_clients", len(s.clients)).
+		Msg("Client disconnected")
 	s.mutex.RUnlock()
 
 	conn.Close()
@@ -156,7 +170,7 @@ func (s *Server) broadcast(data []byte) {
 		select {
 		case client.Frames <- data:
 		default:
-			log.Printf("Frame dropped!")
+			log.Warn().Msg("Frame dropped")
 		}
 	}
 }
@@ -196,13 +210,17 @@ func (s *Server) handleESC(conn net.Conn) (string, error) {
 	case 79: // fn keys
 	}
 
-	log.Printf("Unknown escape sequence: %v", nextBuf)
+	log.Warn().
+		Bytes("sequence", nextBuf[:n]).
+		Msg("Unknown escape sequence")
 	return "P", nil // i dont fucking know what else to do
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
 	s.wg.Add(1)
 	defer s.wg.Done()
+
+	log := log.With().Str("addr", conn.RemoteAddr().String()).Logger()
 
 	go s.addClient(conn)
 	defer s.removeClient(conn, "unknown error") // just in case
@@ -229,16 +247,16 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 			// check if it's a timeout error
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				log.Printf("Read timeout for %s, disconnecting", conn.RemoteAddr())
+				log.Warn().Msg("Read timeout, disconnecting")
 				s.removeClient(conn, "inactivity")
 				return
 			}
-			log.Printf("Error reading from %s: %v", conn.RemoteAddr(), err)
+			log.Error().Err(err).Msg("Error reading from client")
 			return
 		}
 
 		if n < len(buf) {
-			log.Printf("Error reading from %s", conn.RemoteAddr())
+			log.Error().Msg("Error reading from client")
 			return
 		}
 
@@ -252,7 +270,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		case 0x1b: // ESC sequence
 			key, err = s.handleESC(conn)
 			if err != nil {
-				log.Printf("Error reading from %s: %v", conn.RemoteAddr(), err)
+				log.Error().Err(err).Msg("Error reading escape sequence")
 				return
 			}
 		case ' ':
@@ -267,7 +285,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 		fmt.Printf("keydown %s\nsleep 0.15\nkeyup %s\n", key, key)
 
-		log.Printf("Received from %s: %v", conn.RemoteAddr(), buf)
+		log.Debug().Bytes("data", buf[:n]).Msg("Received from client")
 		conn.SetReadDeadline(time.Now().Add(connectionReadTimeout))
 	}
 }
@@ -289,7 +307,7 @@ func (s *Server) startBroadcaster(reader io.Reader) error {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	log.Println("Initiating graceful shutdown...")
+	log.Info().Msg("Initiating graceful shutdown")
 
 	// signal all connections to close
 	close(s.shutdown)
@@ -303,10 +321,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	select {
 	case <-done:
-		log.Println("All connections closed gracefully")
+		log.Info().Msg("All connections closed gracefully")
 		return nil
 	case <-ctx.Done():
-		log.Println("Shutdown timeout exceeded, forcing close")
+		log.Warn().Msg("Shutdown timeout exceeded, forcing close")
 		return ctx.Err()
 	}
 }
@@ -323,11 +341,11 @@ func main() {
 
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal().Err(err).Msg("Failed to start listener")
 	}
 	defer listener.Close()
 
-	log.Printf("Server listening on %s", listenAddr)
+	log.Info().Str("addr", listenAddr).Msg("Server listening")
 
 	server := NewServer()
 
@@ -337,15 +355,15 @@ func main() {
 		// Read from file
 		file, err := os.Open(os.Args[2])
 		if err != nil {
-			log.Fatalf("Error opening file: %v", err)
+			log.Fatal().Err(err).Str("file", os.Args[2]).Msg("Error opening file")
 		}
 		defer file.Close()
 		input = file
-		log.Printf("Reading broadcast messages from file: %s", os.Args[2])
+		log.Info().Str("file", os.Args[2]).Msg("Reading broadcast messages from file")
 	} else {
 		// Read from stdin
 		input = os.Stdin
-		log.Println("Reading broadcast messages from stdin")
+		log.Info().Msg("Reading broadcast messages from stdin")
 	}
 
 	sigErr := make(chan struct{}, 1)
@@ -353,7 +371,7 @@ func main() {
 	go func() {
 		err := server.startBroadcaster(input)
 		if err != nil {
-			log.Printf("Error reading broadcast input: %v", err)
+			log.Error().Err(err).Msg("Error reading broadcast input")
 		}
 		sigErr <- struct{}{}
 	}()
@@ -367,7 +385,7 @@ func main() {
 				case <-server.shutdown:
 					// Shutdown initiated, stop accepting silently
 				default:
-					log.Printf("Error accepting connection: %v", err)
+					log.Error().Err(err).Msg("Error accepting connection")
 				}
 				return
 			}
@@ -383,9 +401,9 @@ func main() {
 	// Wait for shutdown signal
 	select {
 	case sig := <-sigChan:
-		log.Printf("Received signal: %v", sig)
+		log.Info().Str("signal", sig.String()).Msg("Received signal")
 	case <-sigErr:
-		log.Print("Shutting down due to an error")
+		log.Warn().Msg("Shutting down due to an error")
 	}
 
 	// Stop accepting new connections
@@ -396,9 +414,9 @@ func main() {
 	defer cancel()
 
 	if err := server.Shutdown(ctx); err != nil {
-		log.Printf("Shutdown error: %v", err)
+		log.Error().Err(err).Msg("Shutdown error")
 		os.Exit(1)
 	}
 
-	log.Println("Server stopped")
+	log.Info().Msg("Server stopped")
 }
