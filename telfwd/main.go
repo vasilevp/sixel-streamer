@@ -15,7 +15,7 @@ import (
 )
 
 func init() {
-	// Route all log output to stderr
+	// stdout is used for streaming, so use stderr for everything
 	log.SetOutput(os.Stderr)
 }
 
@@ -59,7 +59,7 @@ func (s *Server) addClient(conn net.Conn) {
 	conn.SetWriteDeadline(time.Now().Add(connectionWriteTimeout))
 	defer conn.SetWriteDeadline(time.Time{})
 
-	// Hide cursor
+	// hide cursor
 	fmt.Fprint(conn, "\033[?25l")
 
 	const message = "Welcome to Terminal Doom!\r\n" +
@@ -272,15 +272,12 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 }
 
-func (s *Server) startBroadcaster(reader io.Reader) {
+func (s *Server) startBroadcaster(reader io.Reader) error {
 	buf := make([]byte, 60000)
 	for {
 		n, err := reader.Read(buf)
 		if err != nil {
-			if err != io.EOF {
-				log.Printf("Error reading broadcast input: %v", err)
-			}
-			return
+			return err
 		}
 
 		if n > 0 {
@@ -334,10 +331,6 @@ func main() {
 
 	server := NewServer()
 
-	// Setup signal handling for graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
 	// Determine input source (file or stdin)
 	var input io.Reader
 	if len(os.Args) > 2 {
@@ -355,8 +348,15 @@ func main() {
 		log.Println("Reading broadcast messages from stdin")
 	}
 
+	sigErr := make(chan struct{}, 1)
 	// Start broadcaster that reads from input source
-	go server.startBroadcaster(input)
+	go func() {
+		err := server.startBroadcaster(input)
+		if err != nil {
+			log.Printf("Error reading broadcast input: %v", err)
+		}
+		sigErr <- struct{}{}
+	}()
 
 	// Accept connections in a goroutine
 	go func() {
@@ -376,9 +376,17 @@ func main() {
 		}
 	}()
 
+	// Setup signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
 	// Wait for shutdown signal
-	sig := <-sigChan
-	log.Printf("Received signal: %v", sig)
+	select {
+	case sig := <-sigChan:
+		log.Printf("Received signal: %v", sig)
+	case <-sigErr:
+		log.Print("Shutting down due to an error")
+	}
 
 	// Stop accepting new connections
 	listener.Close()
