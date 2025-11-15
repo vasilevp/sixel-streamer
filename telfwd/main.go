@@ -1,13 +1,16 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -26,20 +29,23 @@ type Client struct {
 }
 
 type Server struct {
-	clients map[net.Conn]*Client
-	mutex   sync.RWMutex
+	clients  map[net.Conn]*Client
+	mutex    sync.RWMutex
+	shutdown chan struct{}
+	wg       sync.WaitGroup
 }
 
 func NewServer() *Server {
 	return &Server{
-		clients: make(map[net.Conn]*Client),
+		clients:  make(map[net.Conn]*Client),
+		shutdown: make(chan struct{}),
 	}
 }
 
 func (s *Server) addClient(conn net.Conn) {
 	client := Client{
 		Ready:  false,
-		Frames: make(chan []byte, 30),
+		Frames: make(chan []byte, 15),
 		Done:   make(chan struct{}),
 	}
 
@@ -63,7 +69,13 @@ func (s *Server) addClient(conn net.Conn) {
 		"\tFire: F\r\n" +
 		"\tUse: SPACE\r\n" +
 		"\tSprint: SHIFT (CAPSLOCK to toggle)\r\n\r\n" +
-		"This is a shared session, so players' inputs may interfere with each other.\r\n"
+		"Notes:\r\n" +
+		"\t- Do not hold input keys, tap them repeatedly instead!\r\n" +
+		"\t  Otherwise, input will buffer and you're going to have a bad time.\r\n" +
+		"\t- This is a shared session, so players may interfere with each other.\r\n" +
+		"\t- The stream might stutter during the first ~5 seconds, (depending on\r\n" +
+		"\t  your ping but it should catch up.\r\n" +
+		"\r\n"
 
 	fmt.Fprint(conn, message)
 
@@ -76,10 +88,17 @@ func (s *Server) addClient(conn net.Conn) {
 	}
 
 	fmt.Fprint(conn, "Have fun!\r\n"+
-		"Terminal Doom by pvas\r\n",
+		"Terminal Doom by pvas\r\n"+
+		"Joining in ",
 	)
 
-	time.Sleep(time.Second * 3)
+	for i := range 5 {
+		if i > 0 {
+			fmt.Fprint(conn, "\b\b\b\b") // erase previous number
+		}
+		fmt.Fprintf(conn, "%d...", 5-i)
+		time.Sleep(time.Second * 1)
+	}
 
 	client.Ready = true
 
@@ -113,7 +132,7 @@ func (s *Server) removeClient(conn net.Conn, message string) {
 
 	<-client.Done
 
-	// Show cursor, exit SIXEL mode, clear screen, and send goodbye message
+	// show cursor, exit SIXEL mode, clear screen, and send goodbye message
 	fmt.Fprint(conn, "\033[?25h\x1b\\\x1b[2J\x1b[H\r\n\r\n"+
 		"Connection closed: "+message+".\r\n"+
 		"Goodbye!\r\n")
@@ -143,9 +162,9 @@ func (s *Server) broadcast(data []byte) {
 }
 
 func (s *Server) handleESC(conn net.Conn) (string, error) {
-	// Set a short read timeout to check if more data is coming
+	// set a short read timeout to check if more data is coming
 	conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
-	// Reset deadline
+	// reset deadline
 	defer conn.SetReadDeadline(time.Now().Add(connectionReadTimeout))
 
 	nextBuf := make([]byte, 2)
@@ -182,14 +201,33 @@ func (s *Server) handleESC(conn net.Conn) (string, error) {
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
+	s.wg.Add(1)
+	defer s.wg.Done()
+
 	go s.addClient(conn)
 	defer s.removeClient(conn, "unknown error") // just in case
+
+	// set initial read deadline
+	conn.SetReadDeadline(time.Now().Add(connectionReadTimeout))
+
+	// monitor shutdown signal and close connection if needed
+	go func() {
+		<-s.shutdown
+		s.removeClient(conn, "server shutting down")
+	}()
 
 	buf := []byte{0}
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
-			// Check if it's a timeout error
+			// check if shutdown was triggered
+			select {
+			case <-s.shutdown:
+				return
+			default:
+			}
+
+			// check if it's a timeout error
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				log.Printf("Read timeout for %s, disconnecting", conn.RemoteAddr())
 				s.removeClient(conn, "inactivity")
@@ -253,6 +291,29 @@ func (s *Server) startBroadcaster(reader io.Reader) {
 	}
 }
 
+func (s *Server) Shutdown(ctx context.Context) error {
+	log.Println("Initiating graceful shutdown...")
+
+	// signal all connections to close
+	close(s.shutdown)
+
+	// create a channel to signal when all goroutines are done
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Println("All connections closed gracefully")
+		return nil
+	case <-ctx.Done():
+		log.Println("Shutdown timeout exceeded, forcing close")
+		return ctx.Err()
+	}
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "Usage: telfwd <port> [input-file]")
@@ -272,6 +333,10 @@ func main() {
 	log.Printf("Server listening on %s", listenAddr)
 
 	server := NewServer()
+
+	// Setup signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	// Determine input source (file or stdin)
 	var input io.Reader
@@ -293,13 +358,39 @@ func main() {
 	// Start broadcaster that reads from input source
 	go server.startBroadcaster(input)
 
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			log.Printf("Error accepting connection: %v", err)
-			continue
-		}
+	// Accept connections in a goroutine
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				select {
+				case <-server.shutdown:
+					// Shutdown initiated, stop accepting silently
+				default:
+					log.Printf("Error accepting connection: %v", err)
+				}
+				return
+			}
 
-		go server.handleConnection(conn)
+			go server.handleConnection(conn)
+		}
+	}()
+
+	// Wait for shutdown signal
+	sig := <-sigChan
+	log.Printf("Received signal: %v", sig)
+
+	// Stop accepting new connections
+	listener.Close()
+
+	// Graceful shutdown with 5 second timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("Shutdown error: %v", err)
+		os.Exit(1)
 	}
+
+	log.Println("Server stopped")
 }
