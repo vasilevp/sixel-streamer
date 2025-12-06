@@ -1,0 +1,47 @@
+# /etc/systemd/system/crispy-doom.service
+[Unit]
+Description=Crispy Doom headless watchdog
+After=network.target
+
+[Service]
+Type=notify
+Environment=DISPLAY=:99
+# Environment=SDL_VIDEODRIVER=x11
+Environment=SDL_AUDIODRIVER=dummy
+# Environment=SDL_VIDEO_FULLSCREEN_DISPLAY=0
+# Environment=SDL_VIDEO_WINDOW_POS=0,0
+# Environment=SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR=0
+# Environment=SDL_VIDEO_ALLOW_SCREENSAVER=0
+Environment=XDG_DATA_HOME=/root/.local/share/
+Restart=always
+RestartSec=0
+WatchdogSec=30s
+# RuntimeMaxSec=6h
+WorkingDirectory=/root/sixel/UZDoom/build/
+NotifyAccess=all
+
+ExecStart=/usr/bin/env bash -c "								\
+	set +xe;													\
+	systemd-notify --ready;										\
+	/usr/games/crispy-doom -nosound -nomouse -fullscreen & 		\
+	PID=$!;														\
+	while kill -0 $PID 2>/dev/null; do							\
+		CPU1=$(awk '{print $14+$15}' /proc/$PID/stat);			\
+		TOTAL1=$(awk '{print $2+$4+$5}' /proc/stat | head -n1);	\
+		sleep 1;												\
+		CPU2=$(awk '{print $14+$15}' /proc/$PID/stat);			\
+		TOTAL2=$(awk '{print $2+$4+$5}' /proc/stat | head -n1);	\
+		CPU_USAGE=$((100 * (CPU2 - CPU1) / (TOTAL2 - TOTAL1)));	\
+		if [ $CPU_USAGE -gt 5 ]; then							\
+			systemd-notify WATCHDOG=1;							\
+			echo CPU usage: $CPU_USAGE%, game is alive;			\
+		fi;														\
+		sleep 10 &												\
+		SLEEPPID=$!;											\
+		wait -n $PID $SLEEPPID;									\
+	done;														\
+	wait $PID;													\
+	"
+
+[Install]
+WantedBy=multi-user.target
