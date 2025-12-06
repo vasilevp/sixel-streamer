@@ -29,9 +29,11 @@ const connectionWriteTimeout = time.Second * 10
 const statusUpdateInterval = time.Second * 5
 
 type Client struct {
-	Ready  bool
-	Frames chan []byte
-	Done   chan struct{}
+	Ready     bool
+	Frames    chan []byte
+	Messages  chan string
+	Done      chan struct{}
+	PressTime time.Duration
 }
 
 type Server struct {
@@ -51,9 +53,11 @@ func NewServer() *Server {
 
 func (s *Server) addClient(conn net.Conn) {
 	client := Client{
-		Ready:  false,
-		Frames: make(chan []byte, 15),
-		Done:   make(chan struct{}),
+		Ready:     false,
+		Frames:    make(chan []byte, 15),
+		Messages:  make(chan string, 15),
+		Done:      make(chan struct{}),
+		PressTime: 150 * time.Millisecond,
 	}
 
 	s.mutex.RLock()
@@ -67,8 +71,7 @@ func (s *Server) addClient(conn net.Conn) {
 	conn.SetWriteDeadline(time.Now().Add(connectionWriteTimeout))
 	defer conn.SetWriteDeadline(time.Time{})
 
-	// hide cursor
-	fmt.Fprint(conn, "\033[?25l")
+	fmt.Fprint(conn, HideCursor)
 
 	const message = "Welcome to Terminal Doom!\r\n" +
 		"Controls:\r\n" +
@@ -76,7 +79,9 @@ func (s *Server) addClient(conn net.Conn) {
 		"\tTurn left/right: Q/E\r\n" +
 		"\tFire: F\r\n" +
 		"\tUse: SPACE\r\n" +
-		"\tSprint: SHIFT (CAPSLOCK to toggle)\r\n\r\n" +
+		"\tSprint: SHIFT (CAPSLOCK to toggle)\r\n" +
+		"\tAdjust keypress duration: +/-\r\n" +
+		"\tClear screen: BACKSPACE\r\n\r\n" +
 		"Notes:\r\n" +
 		"\t- Do not hold input keys, tap them repeatedly instead!\r\n" +
 		"\t  Otherwise, input will buffer and you're going to have a bad time.\r\n" +
@@ -100,13 +105,16 @@ func (s *Server) addClient(conn net.Conn) {
 		"Joining in ",
 	)
 
-	for i := range 5 {
+	const countdownSeconds = 5
+	for i := range countdownSeconds {
 		if i > 0 {
 			fmt.Fprint(conn, "\b\b\b\b") // erase previous number
 		}
-		fmt.Fprintf(conn, "%d...", 5-i)
+		fmt.Fprintf(conn, "%d...", countdownSeconds-i)
 		time.Sleep(time.Second * 1)
 	}
+
+	fmt.Fprint(conn, ClearScreen+HomeCursor)
 
 	s.mutex.Lock()
 	s.clients[conn] = &client
@@ -116,19 +124,46 @@ func (s *Server) addClient(conn net.Conn) {
 
 	go func() {
 		defer func() {
-			client.Done <- struct{}{}
 			close(client.Done)
 		}()
 
 		log.Info().Msg("Client ready to receive frames")
-		for data := range client.Frames {
-			_, err := conn.Write(data)
-			if err != nil {
-				log.Error().
-					Err(err).
-					Str("addr", conn.RemoteAddr().String()).
-					Msg("Error broadcasting to client")
-				s.removeClient(conn, err.Error())
+
+		for {
+			select {
+			case data, ok := <-client.Frames:
+				if !ok {
+					return
+				}
+
+				_, err := conn.Write(data)
+				if err != nil {
+					log.Error().
+						Err(err).
+						Str("addr", conn.RemoteAddr().String()).
+						Msg("Error broadcasting to client")
+					s.removeClient(conn, err.Error())
+					return
+				}
+
+			case data, ok := <-client.Messages:
+				if !ok {
+					return
+				}
+
+				_, err := conn.Write([]byte(ExitSixel + HomeCursor + MoveCursor(25, 0) + ClearScreen + data + EnterSixel))
+				if err != nil {
+					log.Error().
+						Err(err).
+						Str("addr", conn.RemoteAddr().String()).
+						Msg("Error broadcasting to client")
+					s.removeClient(conn, err.Error())
+					return
+				}
+
+				log.Info().Str("msg", data).Msg("Sent message to client")
+
+			case <-s.shutdown:
 				return
 			}
 		}
@@ -144,12 +179,13 @@ func (s *Server) removeClient(conn net.Conn, message string) {
 	}
 	delete(s.clients, conn)
 	close(client.Frames)
+	close(client.Messages)
 	s.mutex.Unlock()
 
 	<-client.Done
 
 	// show cursor, exit SIXEL mode, clear screen, and send goodbye message
-	fmt.Fprint(conn, "\033[?25h\x1b\\\x1b[2J\x1b[H\r\n\r\n"+
+	fmt.Fprint(conn, ExitSixel+ClearScreen+ShowCursor+HomeCursor+"\r\n\r\n"+
 		"Connection closed: "+message+".\r\n"+
 		"Goodbye!\r\n")
 
@@ -227,7 +263,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	log := log.With().Str("addr", conn.RemoteAddr().String()).Logger()
 
-	go s.addClient(conn)
+	s.addClient(conn)
 	defer s.removeClient(conn, "unknown error") // just in case
 
 	// set initial read deadline
@@ -253,7 +289,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 			// check if it's a timeout error
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				log.Warn().Msg("Read timeout, disconnecting")
-				s.removeClient(conn, "inactivity")
+				s.removeClient(conn, "inactivity or read timeout")
 				return
 			}
 			log.Error().Err(err).Msg("Error reading from client")
@@ -265,30 +301,77 @@ func (s *Server) handleConnection(conn net.Conn) {
 			return
 		}
 
+		client, found := s.clients[conn]
+		if !found {
+			log.Error().Msg("Client not found in server records")
+			return
+		}
+
 		var key string
 		switch buf[0] {
 		case 0x04: // EOF (CTRL+D)
 			continue
+
 		case 0x03: // CTRL+C
 			s.removeClient(conn, "CTRL+C received")
 			return
+
 		case 0x1b: // ESC sequence
 			key, err = s.handleESC(conn)
 			if err != nil {
 				log.Error().Err(err).Msg("Error reading escape sequence")
 				return
 			}
+
+		case 0x7f, 0x08: // Backspace (DEL or BS)
+			fmt.Fprint(conn, ClearScreen+HomeCursor)
+			continue
+
 		case ' ':
 			key = "space"
+
 		case '\r', '\n': // Enter/Return
 			key = "Return"
+
 		case 'f', 'F':
 			key = "control"
+
+		case '+', '=':
+			if client.PressTime < 25*time.Millisecond {
+				client.PressTime += time.Millisecond
+			} else {
+				client.PressTime += 25 * time.Millisecond
+			}
+
+			if client.PressTime > time.Second {
+				client.PressTime = time.Second
+			}
+
+			client.Messages <- "Keypress duration changed to " + client.PressTime.String()
+
+		case '-', '_':
+			if client.PressTime <= 25*time.Millisecond {
+				client.PressTime -= time.Millisecond
+			} else {
+				client.PressTime -= 25 * time.Millisecond
+			}
+			if client.PressTime <= 0 {
+				client.PressTime = time.Millisecond
+			}
+			client.Messages <- "Keypress duration changed to " + client.PressTime.String()
+
 		default:
-			key = string(buf[0])
+			r := rune(buf[0])
+			if !(r >= '0' && r <= '9' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z') {
+				continue
+			}
+			key = string(r)
+			// log.Debug().Str("key", key).Msg("Processed key press")
 		}
 
-		fmt.Printf("keydown %s\nsleep 0.15\nkeyup %s\n", key, key)
+		log.Debug().Msgf("keydown %s\nsleep %f\nkeyup %s\n", key, client.PressTime.Seconds(), key)
+		fmt.Printf("keydown %s\nsleep %f\nkeyup %s\n", key, client.PressTime.Seconds(), key)
+		time.Sleep(client.PressTime)
 
 		log.Debug().Bytes("data", buf[:n]).Msg("Received from client")
 		conn.SetReadDeadline(time.Now().Add(connectionReadTimeout))
@@ -315,17 +398,17 @@ func (s *Server) setOverlayText(text string) {
 }
 
 func (s *Server) startBroadcaster(reader io.Reader) error {
-	buf := make([]byte, 60000)
+	buf := make([]byte, 1024*1024)
 	for {
 		n, err := reader.Read(buf)
-		if err != nil {
-			return err
-		}
-
 		if n > 0 {
 			tmp := make([]byte, n)
 			copy(tmp, buf[:n])
 			s.broadcast(tmp[:n])
+		}
+
+		if err != nil {
+			return err
 		}
 	}
 }
