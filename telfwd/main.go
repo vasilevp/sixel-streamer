@@ -26,6 +26,7 @@ func init() {
 
 const connectionReadTimeout = time.Minute * 2
 const connectionWriteTimeout = time.Second * 10
+const statusUpdateInterval = time.Second * 5
 
 type Client struct {
 	Ready  bool
@@ -38,6 +39,7 @@ type Server struct {
 	mutex    sync.RWMutex
 	shutdown chan struct{}
 	wg       sync.WaitGroup
+	overlay  *os.File
 }
 
 func NewServer() *Server {
@@ -54,15 +56,13 @@ func (s *Server) addClient(conn net.Conn) {
 		Done:   make(chan struct{}),
 	}
 
-	s.mutex.Lock()
+	s.mutex.RLock()
 	numclients := len(s.clients)
-	s.clients[conn] = &client
-	s.mutex.Unlock()
-
 	log.Info().
 		Str("addr", conn.RemoteAddr().String()).
 		Int("total_clients", numclients).
 		Msg("Client connected")
+	s.mutex.RUnlock()
 
 	conn.SetWriteDeadline(time.Now().Add(connectionWriteTimeout))
 	defer conn.SetWriteDeadline(time.Time{})
@@ -108,6 +108,10 @@ func (s *Server) addClient(conn net.Conn) {
 		time.Sleep(time.Second * 1)
 	}
 
+	s.mutex.Lock()
+	s.clients[conn] = &client
+	s.mutex.Unlock()
+
 	client.Ready = true
 
 	go func() {
@@ -116,6 +120,7 @@ func (s *Server) addClient(conn net.Conn) {
 			close(client.Done)
 		}()
 
+		log.Info().Msg("Client ready to receive frames")
 		for data := range client.Frames {
 			_, err := conn.Write(data)
 			if err != nil {
@@ -290,6 +295,25 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 }
 
+func (s *Server) setOverlayText(text string) {
+	overlayText := fmt.Sprintf("Terminal Doom by pvas\n%s\n", text)
+	err := s.overlay.Truncate(0)
+	if err != nil {
+		log.Error().Err(err).Msg("Error truncating overlay file")
+		return
+	}
+	_, err = s.overlay.Seek(0, io.SeekStart)
+	if err != nil {
+		log.Error().Err(err).Msg("Error seeking overlay file")
+		return
+	}
+	_, err = s.overlay.WriteString(overlayText)
+	if err != nil {
+		log.Error().Err(err).Msg("Error writing to overlay file")
+		return
+	}
+}
+
 func (s *Server) startBroadcaster(reader io.Reader) error {
 	buf := make([]byte, 60000)
 	for {
@@ -366,6 +390,14 @@ func main() {
 		log.Info().Msg("Reading broadcast messages from stdin")
 	}
 
+	overlay, err := os.Create("overlay.txt")
+	if err != nil {
+		log.Error().Err(err).Msg("Error creating overlay file")
+		return
+	}
+	server.overlay = overlay
+	defer server.overlay.Close()
+
 	sigErr := make(chan struct{}, 1)
 	// Start broadcaster that reads from input source
 	go func() {
@@ -374,6 +406,30 @@ func main() {
 			log.Error().Err(err).Msg("Error reading broadcast input")
 		}
 		sigErr <- struct{}{}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(statusUpdateInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				numClients := func() int {
+					server.mutex.RLock()
+					defer server.mutex.RUnlock()
+					return len(server.clients)
+				}()
+
+				if numClients > 1 {
+					server.setOverlayText(fmt.Sprintf("%d players connected", numClients))
+				} else if numClients == 1 {
+					server.setOverlayText("1 player connected")
+				}
+
+			case <-server.shutdown:
+				return
+			}
+		}
 	}()
 
 	// Accept connections in a goroutine

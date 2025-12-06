@@ -88,7 +88,7 @@ if findscreen xvfb; then
 	echo "Xvfb screen already running"
 else
 	echo "Starting Xvfb on display $DISPLAY"
-	screen -dm -S xvfb Xvfb $DISPLAY -screen 0 800x600x24 +extension RANDR
+	screen -dm -S xvfb Xvfb $DISPLAY -screen 0 480x360x24 +extension RANDR
 	sleep 1
 fi
 
@@ -106,7 +106,7 @@ else
 	echo "Starting ffmpeg/telfwd pipeline to forward ffmpeg output to clients"
 	screen -dm -S ffmpeg bash -c "
 		pushd $repo/telfwd
-		ffmpeg -f x11grab -i $DISPLAY -f $SIXEL_ENCODER -s $RESOLUTION -diffuse $DIFFUSE -reqcolors $COLORS -ignoredelay $IGNOREDELAY -dropframe $DROPFRAME - | go run . $PORT | ./sendkey.sh
+		ffmpeg -f x11grab -i $DISPLAY -vf "drawtext=textfile='overlay.txt':x=300:y=0:fontcolor=white@0.5:fontsize=12:reload=1" -f $SIXEL_ENCODER -s $RESOLUTION -diffuse $DIFFUSE -reqcolors $COLORS -ignoredelay $IGNOREDELAY -dropframe $DROPFRAME - | go run . $PORT | ./sendkey.sh
 		popd
 	"
 fi
